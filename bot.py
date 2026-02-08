@@ -1,0 +1,340 @@
+import discord
+from discord.ext import commands, tasks
+import os
+import sqlite3
+import time
+import asyncio
+import aiohttp
+from datetime import datetime, timedelta
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+logger = logging.getLogger('gtps_bot')
+
+# Configuration
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+GTPS_SERVER_URL = os.getenv('GTPS_SERVER_URL', 'http://localhost:8080')
+VP_CHANNEL_ID = int(os.getenv('VP_CHANNEL_ID', '0'))
+GEMS_CHANNEL_ID = int(os.getenv('GEMS_CHANNEL_ID', '0'))
+
+# VP earning rates
+VP_PER_MINUTE = 2  # 2 VP per minute in VP channel
+GEMS_MULTIPLIER = 1.05  # 1.05x gems in gems channel
+CHECK_INTERVAL = 60  # Check every 60 seconds
+
+# Bot setup
+intents = discord.Intents.default()
+intents.message_content = True
+intents.voice_states = True
+intents.members = True
+
+bot = commands.Bot(command_prefix='/', intents=intents)
+
+# Database setup
+class Database:
+    def __init__(self, db_path='gtps_vp.db'):
+        self.db_path = db_path
+        self.init_db()
+    
+    def get_connection(self):
+        return sqlite3.connect(self.db_path)
+    
+    def init_db(self):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # VP tracking by Discord ID only
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS vp_balance (
+                discord_id INTEGER PRIMARY KEY,
+                discord_name TEXT,
+                vp INTEGER DEFAULT 0,
+                total_earned INTEGER DEFAULT 0,
+                last_seen INTEGER
+            )
+        ''')
+        
+        # Voice tracking table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS voice_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_id INTEGER,
+                channel_id INTEGER,
+                joined_at INTEGER,
+                left_at INTEGER,
+                vp_earned INTEGER DEFAULT 0
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized")
+    
+    def get_or_create_user(self, discord_id, discord_name):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Check if exists
+        cursor.execute('SELECT * FROM vp_balance WHERE discord_id=?', (discord_id,))
+        user = cursor.fetchone()
+        
+        if not user:
+            # Create new user
+            cursor.execute('''
+                INSERT INTO vp_balance (discord_id, discord_name, last_seen)
+                VALUES (?, ?, ?)
+            ''', (discord_id, discord_name, int(time.time())))
+            conn.commit()
+            cursor.execute('SELECT * FROM vp_balance WHERE discord_id=?', (discord_id,))
+            user = cursor.fetchone()
+        
+        conn.close()
+        return user
+    
+    def add_vp(self, discord_id, amount):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE vp_balance SET vp=vp+?, total_earned=total_earned+?, last_seen=?
+            WHERE discord_id=?
+        ''', (amount, amount, int(time.time()), discord_id))
+        conn.commit()
+        
+        # Get new balance
+        cursor.execute('SELECT vp FROM vp_balance WHERE discord_id=?', (discord_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else 0
+    
+    def get_vp(self, discord_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT vp FROM vp_balance WHERE discord_id=?', (discord_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else 0
+    
+    def spend_vp(self, discord_id, amount):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT vp FROM vp_balance WHERE discord_id=?', (discord_id,))
+        user = cursor.fetchone()
+        if not user or user[0] < amount:
+            conn.close()
+            return False
+        
+        cursor.execute('UPDATE vp_balance SET vp=vp-? WHERE discord_id=?', (amount, discord_id))
+        conn.commit()
+        conn.close()
+        return True
+    
+    def get_leaderboard(self, limit=10):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT discord_name, total_earned FROM vp_balance
+            ORDER BY total_earned DESC LIMIT ?
+        ''', (limit,))
+        results = cursor.fetchall()
+        conn.close()
+        return results
+
+# Initialize database
+db = Database()
+
+# Voice state tracking
+voice_tracking = {}  # {discord_id: {'channel_id': id, 'joined_at': timestamp}}
+
+@bot.event
+async def on_ready():
+    logger.info(f'Bot logged in as {bot.user}')
+    logger.info(f'VP Channel ID: {VP_CHANNEL_ID}')
+    logger.info(f'Gems Channel ID: {GEMS_CHANNEL_ID}')
+    
+    # Start background tasks
+    check_voice_states.start()
+    save_data.start()
+    
+    # Sync slash commands
+    try:
+        synced = await bot.tree.sync()
+        logger.info(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        logger.error(f"Failed to sync commands: {e}")
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Track when users join/leave voice channels"""
+    discord_id = member.id
+    
+    # User joined a voice channel
+    if after.channel and not before.channel:
+        voice_tracking[discord_id] = {
+            'channel_id': after.channel.id,
+            'joined_at': time.time()
+        }
+        # Create user if doesn't exist
+        db.get_or_create_user(discord_id, member.name)
+        logger.info(f"{member.name} joined voice channel {after.channel.name}")
+    
+    # User left a voice channel
+    elif before.channel and not after.channel:
+        if discord_id in voice_tracking:
+            del voice_tracking[discord_id]
+            logger.info(f"{member.name} left voice channel")
+    
+    # User switched channels
+    elif before.channel and after.channel and before.channel.id != after.channel.id:
+        voice_tracking[discord_id] = {
+            'channel_id': after.channel.id,
+            'joined_at': time.time()
+        }
+        logger.info(f"{member.name} switched to {after.channel.name}")
+
+@tasks.loop(seconds=CHECK_INTERVAL)
+async def check_voice_states():
+    """Award VP to users in voice channels"""
+    current_time = time.time()
+    awarded_count = 0
+    
+    for discord_id, data in list(voice_tracking.items()):
+        channel_id = data['channel_id']
+        joined_at = data['joined_at']
+        
+        # Calculate time in channel
+        minutes_elapsed = (current_time - joined_at) / 60
+        
+        # Only award if been in channel for at least 1 minute
+        if minutes_elapsed >= 1:
+            # Award VP if in VP channel
+            if channel_id == VP_CHANNEL_ID:
+                vp_earned = int(minutes_elapsed * VP_PER_MINUTE)
+                if vp_earned > 0:
+                    new_balance = db.add_vp(discord_id, vp_earned)
+                    logger.info(f"[VP] Awarded {vp_earned} VP to Discord ID {discord_id} (new balance: {new_balance})")
+                    awarded_count += 1
+                    
+                    # Reset timer
+                    voice_tracking[discord_id]['joined_at'] = current_time
+            
+            # Log gems channel activity
+            elif channel_id == GEMS_CHANNEL_ID:
+                logger.info(f"[GEMS] Discord ID {discord_id} in gems channel (1.05x multiplier)")
+    
+    if awarded_count > 0:
+        logger.info(f"[CHECK] Awarded VP to {awarded_count} user(s)")
+
+@tasks.loop(minutes=5)
+async def save_data():
+    """Periodic save notification"""
+    logger.info("[AUTO-SAVE] Database saved")
+
+# Slash Commands
+@bot.tree.command(name="vp", description="Check your Voice Points balance")
+async def vp_command(interaction: discord.Interaction):
+    """Check VP balance"""
+    user = db.get_or_create_user(interaction.user.id, interaction.user.name)
+    
+    embed = discord.Embed(
+        title="💎 Voice Points Balance",
+        color=discord.Color.purple()
+    )
+    embed.add_field(name="Discord", value=interaction.user.mention, inline=True)
+    embed.add_field(name="Current VP", value=f"{user[2]:,}", inline=True)
+    embed.add_field(name="Total Earned", value=f"{user[3]:,}", inline=True)
+    
+    # Check if in voice channel
+    member = interaction.guild.get_member(interaction.user.id)
+    if member.voice and member.voice.channel:
+        channel_name = member.voice.channel.name
+        if member.voice.channel.id == VP_CHANNEL_ID:
+            embed.add_field(
+                name="🎙️ Active Bonus", 
+                value=f"Earning {VP_PER_MINUTE} VP/min in **{channel_name}**",
+                inline=False
+            )
+        elif member.voice.channel.id == GEMS_CHANNEL_ID:
+            embed.add_field(
+                name="💎 Active Bonus",
+                value=f"1.05x Gems multiplier in **{channel_name}**",
+                inline=False
+            )
+    
+    embed.set_footer(text="Use VP in-game with /vpshop command")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="leaderboard", description="View top VP earners")
+async def leaderboard_command(interaction: discord.Interaction):
+    """Show VP leaderboard"""
+    top_users = db.get_leaderboard(10)
+    
+    embed = discord.Embed(
+        title="🏆 Top Voice Point Earners",
+        description="Earn VP by staying in voice channels!",
+        color=discord.Color.gold()
+    )
+    
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (discord_name, total_vp) in enumerate(top_users, 1):
+        medal = medals[i-1] if i <= 3 else f"#{i}"
+        embed.add_field(
+            name=f"{medal} {discord_name}",
+            value=f"**{total_vp:,}** VP",
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="help", description="Show bot commands and information")
+async def help_command(interaction: discord.Interaction):
+    """Show help information"""
+    embed = discord.Embed(
+        title="🎮 GTPS Voice Points Bot",
+        description="Earn Voice Points by staying in voice channels!",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(
+        name="📝 Discord Commands",
+        value=(
+            "`/vp` - Check your VP balance\n"
+            "`/leaderboard` - View top earners\n"
+            "`/help` - Show this message"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="💰 Earning VP",
+        value=f"Stay in <#{VP_CHANNEL_ID}> to earn **{VP_PER_MINUTE} VP per minute**",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="💎 Gems Bonus",
+        value=f"Stay in <#{GEMS_CHANNEL_ID}> for **1.05x gems** while playing in-game",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🛒 In-Game Commands",
+        value=(
+            "`/vp` - Check your VP\n"
+            "`/vpshop` - Browse shop\n"
+            "`/vpbuy <id>` - Purchase items"
+        ),
+        inline=False
+    )
+    
+    embed.set_footer(text="Your VP is linked to your Discord account automatically")
+    await interaction.response.send_message(embed=embed)
+
+# Run bot
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        logger.error("DISCORD_TOKEN not set!")
+        exit(1)
+    
+    bot.run(DISCORD_TOKEN)
+
