@@ -1,19 +1,17 @@
 services:
   - type: web
-    name: gtps-vp-bot
+    name: discord-voice-rewards-bot
     env: python
-    region: frankfurt
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    buildCommand: "bash render_build.sh"
+    startCommand: "bash render_start.sh"
     envVars:
       - key: DISCORD_TOKEN
         sync: false
-      - key: GTPS_SERVER_URL
-        value: https://api.gtps.cloud/g-api/18882
+      - key: API_BASE_URL
+        value: https://api.gtps.cloud/g-api/18882/vp
       - key: VP_CHANNEL_ID
-        sync: false
+        value: "1470057279511466045"
       - key: GEMS_CHANNEL_ID
-        sync: false
+        value: "1470057299631411444"
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: "3.11.0"
