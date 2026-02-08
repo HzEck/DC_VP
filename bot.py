@@ -1,29 +1,27 @@
 import discord
 from discord.ext import commands, tasks
-import os
-import sqlite3
-import time
-import asyncio
 import aiohttp
+import asyncio
+import os
 from datetime import datetime, timedelta
-import logging
+from collections import defaultdict
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
-logger = logging.getLogger('gtps_bot')
+# ============= KONFİGÜRASYON =============
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN', 'YOUR_DISCORD_BOT_TOKEN')
+API_BASE_URL = os.getenv('API_BASE_URL', 'http://your-server.com/casino')
 
-# Configuration
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-GTPS_SERVER_URL = os.getenv('GTPS_SERVER_URL', 'http://localhost:8080')
-VP_CHANNEL_ID = int(os.getenv('VP_CHANNEL_ID', '0'))
-GEMS_CHANNEL_ID = int(os.getenv('GEMS_CHANNEL_ID', '0'))
+# Ses kanalı ID'leri (bunları kendi sunucunuzdan alın)
+VP_VOICE_CHANNEL_ID = int(os.getenv('VP_CHANNEL_ID', '0'))  # VP kazanma kanalı
+GEMS_VOICE_CHANNEL_ID = int(os.getenv('GEMS_CHANNEL_ID', '0'))  # Gems boost kanalı
 
-# VP earning rates
-VP_PER_MINUTE = 2  # 2 VP per minute in VP channel
-GEMS_MULTIPLIER = 1.05  # 1.05x gems in gems channel
-CHECK_INTERVAL = 60  # Check every 60 seconds
+# Ödül ayarları
+VP_REWARD_AMOUNT = 10  # Her 5 dakikada kazanılan VP
+VP_REWARD_INTERVAL = 300  # 5 dakika (saniye)
+GEMS_BOOST_MULTIPLIER = 1.05  # 1.05x gems boost
+GEMS_BOOST_DURATION = 3600  # 1 saat (saniye)
+GEMS_CHECK_INTERVAL = 60  # Her dakika kontrol
 
-# Bot setup
+# ============= BOT SETUP =============
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
@@ -31,522 +29,274 @@ intents.members = True
 
 bot = commands.Bot(command_prefix='/', intents=intents)
 
-# Database setup
-class Database:
-    def __init__(self, db_path='gtps_vp.db'):
-        self.db_path = db_path
-        self.init_db()
-    
-    def get_connection(self):
-        return sqlite3.connect(self.db_path)
-    
-    def init_db(self):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        # VP tracking by Discord ID only
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS vp_balance (
-                discord_id INTEGER PRIMARY KEY,
-                discord_name TEXT,
-                vp INTEGER DEFAULT 0,
-                total_earned INTEGER DEFAULT 0,
-                last_seen INTEGER
-            )
-        ''')
-        
-        # Discord to GrowID links
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS discord_links (
-                discord_id INTEGER PRIMARY KEY,
-                growid TEXT UNIQUE,
-                linked_at INTEGER
-            )
-        ''')
-        
-        # Voice tracking table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS voice_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                discord_id INTEGER,
-                channel_id INTEGER,
-                joined_at INTEGER,
-                left_at INTEGER,
-                vp_earned INTEGER DEFAULT 0
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-        logger.info("Database initialized")
-    
-    def get_or_create_user(self, discord_id, discord_name):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        # Check if exists
-        cursor.execute('SELECT * FROM vp_balance WHERE discord_id=?', (discord_id,))
-        user = cursor.fetchone()
-        
-        if not user:
-            # Create new user
-            cursor.execute('''
-                INSERT INTO vp_balance (discord_id, discord_name, last_seen)
-                VALUES (?, ?, ?)
-            ''', (discord_id, discord_name, int(time.time())))
-            conn.commit()
-            cursor.execute('SELECT * FROM vp_balance WHERE discord_id=?', (discord_id,))
-            user = cursor.fetchone()
-        
-        conn.close()
-        return user
-    
-    def add_vp(self, discord_id, amount):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE vp_balance SET vp=vp+?, total_earned=total_earned+?, last_seen=?
-            WHERE discord_id=?
-        ''', (amount, amount, int(time.time()), discord_id))
-        conn.commit()
-        
-        # Get new balance
-        cursor.execute('SELECT vp FROM vp_balance WHERE discord_id=?', (discord_id,))
-        result = cursor.fetchone()
-        conn.close()
-        return result[0] if result else 0
-    
-    def get_vp(self, discord_id):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT vp FROM vp_balance WHERE discord_id=?', (discord_id,))
-        result = cursor.fetchone()
-        conn.close()
-        return result[0] if result else 0
-    
-    def spend_vp(self, discord_id, amount):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT vp FROM vp_balance WHERE discord_id=?', (discord_id,))
-        user = cursor.fetchone()
-        if not user or user[0] < amount:
-            conn.close()
-            return False
-        
-        cursor.execute('UPDATE vp_balance SET vp=vp-? WHERE discord_id=?', (amount, discord_id))
-        conn.commit()
-        conn.close()
-        return True
-    
-    def get_leaderboard(self, limit=10):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT discord_name, total_earned FROM vp_balance
-            ORDER BY total_earned DESC LIMIT ?
-        ''', (limit,))
-        results = cursor.fetchall()
-        conn.close()
-        return results
+# Kullanıcı ses kanalı takibi
+user_voice_time = defaultdict(lambda: {'vp_start': None, 'gems_start': None})
 
-# Initialize database
-db = Database()
+# ============= API FONKSİYONLARI =============
+async def api_request(endpoint, data):
+    """API'ye POST isteği gönder"""
+    async with aiohttp.ClientSession() as session:
+        try:
+            url = f"{API_BASE_URL}{endpoint}"
+            async with session.post(url, json=data) as response:
+                return await response.json()
+        except Exception as e:
+            print(f"[API ERROR] {endpoint}: {e}")
+            return {"success": False, "error": str(e)}
 
-# Voice state tracking
-voice_tracking = {}  # {discord_id: {'channel_id': id, 'joined_at': timestamp}}
+async def verify_link_code(code, discord_id):
+    """Link kodunu doğrula"""
+    return await api_request('/api/discord/link/verify', {
+        'code': code,
+        'discordID': str(discord_id)
+    })
 
+async def get_linked_user(discord_id):
+    """Discord ID'den bağlı kullanıcıyı getir"""
+    return await api_request('/api/discord/user/get', {
+        'discordID': str(discord_id)
+    })
+
+async def add_vp_reward(discord_id, amount):
+    """VP ödülü ekle"""
+    return await api_request('/api/discord/reward/vp', {
+        'discordID': str(discord_id),
+        'amount': amount
+    })
+
+async def add_gems_boost(discord_id, multiplier, duration):
+    """Gems boost ekle"""
+    return await api_request('/api/discord/reward/boost', {
+        'discordID': str(discord_id),
+        'multiplier': multiplier,
+        'duration': duration
+    })
+
+# ============= BOT EVENTS =============
 @bot.event
 async def on_ready():
-    logger.info(f'Bot logged in as {bot.user}')
-    logger.info(f'VP Channel ID: {VP_CHANNEL_ID}')
-    logger.info(f'Gems Channel ID: {GEMS_CHANNEL_ID}')
+    print(f'[BOT] Logged in as {bot.user.name} ({bot.user.id})')
+    print(f'[BOT] VP Channel: {VP_VOICE_CHANNEL_ID}')
+    print(f'[BOT] Gems Channel: {GEMS_VOICE_CHANNEL_ID}')
+    print('[BOT] Starting voice tracking tasks...')
     
-    # Start background tasks
-    check_voice_states.start()
-    save_data.start()
+    # Task'ları başlat
+    if not check_vp_rewards.is_running():
+        check_vp_rewards.start()
+    if not check_gems_boost.is_running():
+        check_gems_boost.start()
     
-    # Sync slash commands
-    try:
-        synced = await bot.tree.sync()
-        logger.info(f"Synced {len(synced)} command(s)")
-    except Exception as e:
-        logger.error(f"Failed to sync commands: {e}")
+    print('[BOT] Ready!')
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    """Track when users join/leave voice channels"""
-    discord_id = member.id
+    """Ses kanalı değişikliklerini takip et"""
+    if member.bot:
+        return
     
-    # User joined a voice channel
-    if after.channel and not before.channel:
-        voice_tracking[discord_id] = {
-            'channel_id': after.channel.id,
-            'joined_at': time.time()
-        }
-        # Create user if doesn't exist
-        db.get_or_create_user(discord_id, member.name)
-        logger.info(f"{member.name} joined voice channel {after.channel.name}")
+    discord_id = str(member.id)
+    now = datetime.now()
     
-    # User left a voice channel
-    elif before.channel and not after.channel:
-        if discord_id in voice_tracking:
-            del voice_tracking[discord_id]
-            logger.info(f"{member.name} left voice channel")
+    # VP kanalına katıldı
+    if after.channel and after.channel.id == VP_VOICE_CHANNEL_ID:
+        if user_voice_time[discord_id]['vp_start'] is None:
+            user_voice_time[discord_id]['vp_start'] = now
+            print(f"[VP] {member.name} joined VP channel")
     
-    # User switched channels
-    elif before.channel and after.channel and before.channel.id != after.channel.id:
-        voice_tracking[discord_id] = {
-            'channel_id': after.channel.id,
-            'joined_at': time.time()
-        }
-        logger.info(f"{member.name} switched to {after.channel.name}")
-
-@tasks.loop(seconds=CHECK_INTERVAL)
-async def check_voice_states():
-    """Award VP to users in voice channels"""
-    current_time = time.time()
-    awarded_count = 0
+    # VP kanalından ayrıldı
+    elif before.channel and before.channel.id == VP_VOICE_CHANNEL_ID:
+        user_voice_time[discord_id]['vp_start'] = None
+        print(f"[VP] {member.name} left VP channel")
     
-    for discord_id, data in list(voice_tracking.items()):
-        channel_id = data['channel_id']
-        joined_at = data['joined_at']
-        
-        # Calculate time in channel
-        minutes_elapsed = (current_time - joined_at) / 60
-        
-        # Only award if been in channel for at least 1 minute
-        if minutes_elapsed >= 1:
-            # Award VP if in VP channel
-            if channel_id == VP_CHANNEL_ID:
-                vp_earned = int(minutes_elapsed * VP_PER_MINUTE)
-                if vp_earned > 0:
-                    new_balance = db.add_vp(discord_id, vp_earned)
-                    logger.info(f"[VP] Awarded {vp_earned} VP to Discord ID {discord_id} (new balance: {new_balance})")
-                    awarded_count += 1
-                    
-                    # Reset timer
-                    voice_tracking[discord_id]['joined_at'] = current_time
+    # Gems kanalına katıldı
+    if after.channel and after.channel.id == GEMS_VOICE_CHANNEL_ID:
+        if user_voice_time[discord_id]['gems_start'] is None:
+            user_voice_time[discord_id]['gems_start'] = now
+            print(f"[GEMS] {member.name} joined Gems channel")
             
-            # Log gems channel activity
-            elif channel_id == GEMS_CHANNEL_ID:
-                logger.info(f"[GEMS] Discord ID {discord_id} in gems channel (1.05x multiplier)")
+            # Hemen boost ver
+            result = await add_gems_boost(discord_id, GEMS_BOOST_MULTIPLIER, GEMS_BOOST_DURATION)
+            if result.get('success'):
+                try:
+                    await member.send(f"🎁 **Gems Boost Activated!**\n"
+                                    f"Multiplier: {GEMS_BOOST_MULTIPLIER}x\n"
+                                    f"Duration: {GEMS_BOOST_DURATION // 60} minutes")
+                except:
+                    pass
     
-    if awarded_count > 0:
-        logger.info(f"[CHECK] Awarded VP to {awarded_count} user(s)")
+    # Gems kanalından ayrıldı
+    elif before.channel and before.channel.id == GEMS_VOICE_CHANNEL_ID:
+        user_voice_time[discord_id]['gems_start'] = None
+        print(f"[GEMS] {member.name} left Gems channel")
 
-@tasks.loop(minutes=5)
-async def save_data():
-    """Periodic save notification"""
-    logger.info("[AUTO-SAVE] Database saved")
-
-# Slash Commands
-@bot.tree.command(name="link", description="Link your Discord account to your GrowID")
-async def link_command(interaction: discord.Interaction, growid: str):
-    """Link Discord account to GrowID"""
-    discord_id = interaction.user.id
-    
-    # Validate GrowID (basic)
-    growid = growid.strip()
-    if len(growid) < 3 or len(growid) > 18:
-        await interaction.response.send_message(
-            "❌ Invalid GrowID! Must be 3-18 characters.",
-            ephemeral=True
-        )
-        return
-    
-    # Check if already linked
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT growid FROM discord_links WHERE discord_id=?', (discord_id,))
-    existing = cursor.fetchone()
-    
-    if existing:
-        await interaction.response.send_message(
-            f"❌ You are already linked to **{existing[0]}**!\n"
-            f"Contact an admin to change your link.",
-            ephemeral=True
-        )
-        conn.close()
-        return
-    
-    # Check if GrowID already used
-    cursor.execute('SELECT discord_id FROM discord_links WHERE growid=?', (growid,))
-    existing_growid = cursor.fetchone()
-    
-    if existing_growid:
-        await interaction.response.send_message(
-            f"❌ GrowID **{growid}** is already linked to another Discord account!",
-            ephemeral=True
-        )
-        conn.close()
-        return
-    
-    # Link account
+# ============= TASKS =============
+@tasks.loop(seconds=VP_REWARD_INTERVAL)
+async def check_vp_rewards():
+    """VP kanalındaki kullanıcılara ödül ver"""
     try:
-        cursor.execute('''
-            INSERT INTO discord_links (discord_id, growid, linked_at)
-            VALUES (?, ?, ?)
-        ''', (discord_id, growid, int(time.time())))
-        conn.commit()
+        vp_channel = bot.get_channel(VP_VOICE_CHANNEL_ID)
+        if not vp_channel:
+            return
         
-        # Also create VP balance entry
-        db.get_or_create_user(discord_id, interaction.user.name)
+        now = datetime.now()
         
-        await interaction.response.send_message(
-            f"✅ Successfully linked!\n"
-            f"**Discord:** {interaction.user.mention}\n"
-            f"**GrowID:** {growid}\n\n"
-            f"You can now earn VP by staying in voice channels!\n"
-            f"Use `/vp` to check your balance.",
-            ephemeral=True
-        )
-        logger.info(f"Linked {interaction.user.name} ({discord_id}) to {growid}")
-        
+        for member in vp_channel.members:
+            if member.bot:
+                continue
+            
+            discord_id = str(member.id)
+            start_time = user_voice_time[discord_id]['vp_start']
+            
+            if start_time:
+                # 5 dakika geçti mi kontrol et
+                elapsed = (now - start_time).total_seconds()
+                
+                if elapsed >= VP_REWARD_INTERVAL:
+                    # Ödül ver
+                    result = await add_vp_reward(discord_id, VP_REWARD_AMOUNT)
+                    
+                    if result.get('success'):
+                        print(f"[VP REWARD] Gave {VP_REWARD_AMOUNT} VP to {member.name}")
+                        
+                        try:
+                            await member.send(f"💰 **VP Earned!**\n"
+                                            f"You earned {VP_REWARD_AMOUNT} VP for staying in the voice channel!\n"
+                                            f"Total time: {int(elapsed / 60)} minutes")
+                        except:
+                            pass
+                    else:
+                        error = result.get('error', 'Unknown error')
+                        if error == 'Not linked':
+                            try:
+                                await member.send("❌ **Account Not Linked**\n"
+                                                f"Link your account in-game with `/link` command first!")
+                            except:
+                                pass
+                    
+                    # Timer'ı sıfırla
+                    user_voice_time[discord_id]['vp_start'] = now
+    
     except Exception as e:
-        await interaction.response.send_message(
-            f"❌ Failed to link account: {str(e)}",
-            ephemeral=True
-        )
-        logger.error(f"Link error: {e}")
-    finally:
-        conn.close()
+        print(f"[VP REWARD ERROR] {e}")
 
-@bot.tree.command(name="unlink", description="Unlink your Discord account from GrowID (Admin only)")
-async def unlink_command(interaction: discord.Interaction, user: discord.Member = None):
-    """Unlink account (admin command)"""
-    # Check if admin
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
-            "❌ Only administrators can use this command!",
-            ephemeral=True
-        )
+@tasks.loop(seconds=GEMS_CHECK_INTERVAL)
+async def check_gems_boost():
+    """Gems kanalındaki kullanıcıların boost'unu yenile"""
+    try:
+        gems_channel = bot.get_channel(GEMS_VOICE_CHANNEL_ID)
+        if not gems_channel:
+            return
+        
+        for member in gems_channel.members:
+            if member.bot:
+                continue
+            
+            discord_id = str(member.id)
+            
+            # Boost'u yenile (süreyi uzat)
+            await add_gems_boost(discord_id, GEMS_BOOST_MULTIPLIER, GEMS_CHECK_INTERVAL)
+    
+    except Exception as e:
+        print(f"[GEMS BOOST ERROR] {e}")
+
+# ============= KOMUTLAR =============
+@bot.command(name='link')
+async def link_account(ctx, code: str = None):
+    """Discord hesabını Growtopia hesabına bağla"""
+    if not code:
+        await ctx.send("❌ **Usage:** `/link <code>`\n"
+                      "Get your code in-game with `/link` command!")
         return
     
-    target_id = user.id if user else interaction.user.id
-    target_name = user.mention if user else interaction.user.mention
+    code = code.upper().strip()
+    discord_id = str(ctx.author.id)
     
-    conn = db.get_connection()
-    cursor = conn.cursor()
+    # Doğrula
+    result = await verify_link_code(code, discord_id)
     
-    cursor.execute('SELECT growid FROM discord_links WHERE discord_id=?', (target_id,))
-    existing = cursor.fetchone()
-    
-    if not existing:
-        await interaction.response.send_message(
-            f"❌ {target_name} is not linked!",
-            ephemeral=True
-        )
-        conn.close()
-        return
-    
-    cursor.execute('DELETE FROM discord_links WHERE discord_id=?', (target_id,))
-    conn.commit()
-    conn.close()
-    
-    await interaction.response.send_message(
-        f"✅ Unlinked {target_name} from **{existing[0]}**",
-        ephemeral=True
-    )
-    logger.info(f"Unlinked Discord ID {target_id} from {existing[0]}")
-
-@bot.tree.command(name="whois", description="Check who a GrowID is linked to")
-async def whois_command(interaction: discord.Interaction, growid: str):
-    """Check GrowID link"""
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT discord_id, linked_at FROM discord_links WHERE growid=?', (growid,))
-    result = cursor.fetchone()
-    conn.close()
-    
-    if not result:
-        await interaction.response.send_message(
-            f"❌ **{growid}** is not linked to any Discord account.",
-            ephemeral=True
-        )
-        return
-    
-    discord_id, linked_at = result
-    user = await bot.fetch_user(discord_id)
-    linked_date = datetime.fromtimestamp(linked_at).strftime('%Y-%m-%d %H:%M')
-    
-    embed = discord.Embed(
-        title="🔗 Account Link Info",
-        color=discord.Color.blue()
-    )
-    embed.add_field(name="GrowID", value=f"**{growid}**", inline=True)
-    embed.add_field(name="Discord", value=user.mention, inline=True)
-    embed.add_field(name="Linked Since", value=linked_date, inline=False)
-    
-    # Get VP balance
-    vp = db.get_vp(discord_id)
-    embed.add_field(name="VP Balance", value=f"{vp:,}", inline=True)
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="mylink", description="Check your linked GrowID")
-async def mylink_command(interaction: discord.Interaction):
-    """Check own link"""
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT growid, linked_at FROM discord_links WHERE discord_id=?', (interaction.user.id,))
-    result = cursor.fetchone()
-    conn.close()
-    
-    if not result:
-        await interaction.response.send_message(
-            "❌ You are not linked!\nUse `/link <growid>` to link your account.",
-            ephemeral=True
-        )
-        return
-    
-    growid, linked_at = result
-    linked_date = datetime.fromtimestamp(linked_at).strftime('%Y-%m-%d %H:%M')
-    vp = db.get_vp(interaction.user.id)
-    
-    embed = discord.Embed(
-        title="🔗 Your Account Link",
-        color=discord.Color.green()
-    )
-    embed.add_field(name="GrowID", value=f"**{growid}**", inline=True)
-    embed.add_field(name="VP Balance", value=f"{vp:,}", inline=True)
-    embed.add_field(name="Linked Since", value=linked_date, inline=False)
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="vp", description="Check your Voice Points balance")
-async def vp_command(interaction: discord.Interaction):
-    """Check VP balance"""
-    user = db.get_or_create_user(interaction.user.id, interaction.user.name)
-    
-    # Get GrowID if linked
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT growid FROM discord_links WHERE discord_id=?', (interaction.user.id,))
-    link_result = cursor.fetchone()
-    conn.close()
-    
-    embed = discord.Embed(
-        title="💎 Voice Points Balance",
-        color=discord.Color.purple()
-    )
-    embed.add_field(name="Discord", value=interaction.user.mention, inline=True)
-    
-    if link_result:
-        embed.add_field(name="GrowID", value=f"**{link_result[0]}**", inline=True)
+    if result.get('success'):
+        username = result.get('username', 'Unknown')
+        await ctx.send(f"✅ **Account Linked Successfully!**\n"
+                      f"Discord: {ctx.author.mention}\n"
+                      f"Growtopia: `{username}`\n\n"
+                      f"You can now earn rewards by joining voice channels!")
     else:
-        embed.add_field(name="GrowID", value="Not linked", inline=True)
+        error = result.get('error', 'Unknown error')
+        await ctx.send(f"❌ **Link Failed**\n"
+                      f"Error: {error}\n\n"
+                      f"Make sure you:\n"
+                      f"1. Used `/link` command in-game\n"
+                      f"2. Copied the code correctly\n"
+                      f"3. Used the code within 5 minutes")
+
+@bot.command(name='profile')
+async def check_profile(ctx):
+    """Bağlı hesap bilgilerini görüntüle"""
+    discord_id = str(ctx.author.id)
     
-    embed.add_field(name="Current VP", value=f"{user[2]:,}", inline=True)
-    embed.add_field(name="Total Earned", value=f"{user[3]:,}", inline=True)
+    result = await get_linked_user(discord_id)
     
-    # Check if in voice channel
-    member = interaction.guild.get_member(interaction.user.id)
-    if member.voice and member.voice.channel:
-        channel_name = member.voice.channel.name
-        if member.voice.channel.id == VP_CHANNEL_ID:
-            embed.add_field(
-                name="🎙️ Active Bonus", 
-                value=f"Earning {VP_PER_MINUTE} VP/min in **{channel_name}**",
-                inline=False
-            )
-        elif member.voice.channel.id == GEMS_CHANNEL_ID:
-            embed.add_field(
-                name="💎 Active Bonus",
-                value=f"1.05x Gems multiplier in **{channel_name}**",
-                inline=False
-            )
-    
-    if not link_result:
-        embed.set_footer(text="Use /link <growid> to link your account and spend VP in-game!")
+    if result.get('success'):
+        username = result.get('username', 'Unknown')
+        balance = result.get('balance', 0)
+        
+        embed = discord.Embed(title="🎮 Profile", color=discord.Color.green())
+        embed.add_field(name="Discord", value=ctx.author.mention, inline=False)
+        embed.add_field(name="Growtopia", value=f"`{username}`", inline=False)
+        embed.add_field(name="Balance", value=f"{balance:,} WL", inline=False)
+        
+        await ctx.send(embed=embed)
     else:
-        embed.set_footer(text="Use /vpshop in-game to spend your VP!")
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+        await ctx.send("❌ **Account Not Linked**\n"
+                      f"Use `/link <code>` to link your account!\n"
+                      f"Get code in-game with `/link` command.")
 
-@bot.tree.command(name="leaderboard", description="View top VP earners")
-async def leaderboard_command(interaction: discord.Interaction):
-    """Show VP leaderboard"""
-    top_users = db.get_leaderboard(10)
+@bot.command(name='rewards')
+async def check_rewards(ctx):
+    """Ödül sistemi hakkında bilgi"""
+    embed = discord.Embed(title="🎁 Reward System", color=discord.Color.gold())
     
-    embed = discord.Embed(
-        title="🏆 Top Voice Point Earners",
-        description="Earn VP by staying in voice channels!",
-        color=discord.Color.gold()
+    embed.add_field(
+        name="💰 VP Channel",
+        value=f"Join <#{VP_VOICE_CHANNEL_ID}> to earn {VP_REWARD_AMOUNT} VP every {VP_REWARD_INTERVAL // 60} minutes!",
+        inline=False
     )
     
-    medals = ["🥇", "🥈", "🥉"]
-    for i, (discord_name, total_vp) in enumerate(top_users, 1):
-        medal = medals[i-1] if i <= 3 else f"#{i}"
-        embed.add_field(
-            name=f"{medal} {discord_name}",
-            value=f"**{total_vp:,}** VP",
-            inline=False
-        )
+    embed.add_field(
+        name="💎 Gems Boost Channel",
+        value=f"Join <#{GEMS_VOICE_CHANNEL_ID}> to get {GEMS_BOOST_MULTIPLIER}x gems boost!",
+        inline=False
+    )
     
-    await interaction.response.send_message(embed=embed)
+    embed.add_field(
+        name="📝 How to Start",
+        value="1. Use `/link` in Growtopia\n"
+              "2. Copy the 6-digit code\n"
+              "3. Use `/link <code>` here in Discord\n"
+              "4. Join voice channels to earn rewards!",
+        inline=False
+    )
+    
+    await ctx.send(embed=embed)
 
-@bot.tree.command(name="help", description="Show bot commands and information")
-async def help_command(interaction: discord.Interaction):
-    """Show help information"""
-    embed = discord.Embed(
-        title="🎮 GTPS Voice Points Bot",
-        description="Earn Voice Points by staying in voice channels!",
-        color=discord.Color.blue()
-    )
+@bot.command(name='help')
+async def help_command(ctx):
+    """Yardım menüsü"""
+    embed = discord.Embed(title="🤖 Bot Commands", color=discord.Color.blue())
     
-    embed.add_field(
-        name="🔗 Account Management",
-        value=(
-            "`/link <growid>` - Link your Discord to GrowID\n"
-            "`/mylink` - Check your linked GrowID\n"
-            "`/whois <growid>` - Check who owns a GrowID\n"
-            "`/unlink @user` - Unlink account (Admin only)"
-        ),
-        inline=False
-    )
+    embed.add_field(name="/link <code>", value="Link your Growtopia account", inline=False)
+    embed.add_field(name="/profile", value="Check your linked account", inline=False)
+    embed.add_field(name="/rewards", value="View reward system info", inline=False)
+    embed.add_field(name="/help", value="Show this message", inline=False)
     
-    embed.add_field(
-        name="💰 Voice Points",
-        value=(
-            "`/vp` - Check your VP balance\n"
-            "`/leaderboard` - View top earners\n"
-            "`/help` - Show this message"
-        ),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="💎 Earning VP",
-        value=f"Stay in <#{VP_CHANNEL_ID}> to earn **{VP_PER_MINUTE} VP per minute**",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🎁 Gems Bonus",
-        value=f"Stay in <#{GEMS_CHANNEL_ID}> for **1.05x gems** while playing in-game",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🛒 In-Game Commands",
-        value=(
-            "`/vp` - Check your VP\n"
-            "`/vpshop` - Browse shop\n"
-            "`/vpbuy <id>` - Purchase items"
-        ),
-        inline=False
-    )
-    
-    embed.set_footer(text="Link your account with /link to start earning VP!")
-    await interaction.response.send_message(embed=embed)
+    await ctx.send(embed=embed)
 
-# Run bot
-if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        logger.error("DISCORD_TOKEN not set!")
-        exit(1)
+# ============= BOT BAŞLAT =============
+if __name__ == '__main__':
+    print("[BOT] Starting Discord bot...")
+    print(f"[BOT] API URL: {API_BASE_URL}")
     
-    bot.run(DISCORD_TOKEN)
+    if DISCORD_TOKEN == 'YOUR_DISCORD_BOT_TOKEN':
+        print("[ERROR] Please set DISCORD_TOKEN environment variable!")
+    else:
+        bot.run(DISCORD_TOKEN)
