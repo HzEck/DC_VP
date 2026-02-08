@@ -55,6 +55,15 @@ class Database:
             )
         ''')
         
+        # Discord to GrowID links
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS discord_links (
+                discord_id INTEGER PRIMARY KEY,
+                growid TEXT UNIQUE,
+                linked_at INTEGER
+            )
+        ''')
+        
         # Voice tracking table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS voice_sessions (
@@ -231,16 +240,205 @@ async def save_data():
     logger.info("[AUTO-SAVE] Database saved")
 
 # Slash Commands
+@bot.tree.command(name="link", description="Link your Discord account to your GrowID")
+async def link_command(interaction: discord.Interaction, growid: str):
+    """Link Discord account to GrowID"""
+    discord_id = interaction.user.id
+    
+    # Validate GrowID (basic)
+    growid = growid.strip()
+    if len(growid) < 3 or len(growid) > 18:
+        await interaction.response.send_message(
+            "❌ Invalid GrowID! Must be 3-18 characters.",
+            ephemeral=True
+        )
+        return
+    
+    # Check if already linked
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT growid FROM discord_links WHERE discord_id=?', (discord_id,))
+    existing = cursor.fetchone()
+    
+    if existing:
+        await interaction.response.send_message(
+            f"❌ You are already linked to **{existing[0]}**!\n"
+            f"Contact an admin to change your link.",
+            ephemeral=True
+        )
+        conn.close()
+        return
+    
+    # Check if GrowID already used
+    cursor.execute('SELECT discord_id FROM discord_links WHERE growid=?', (growid,))
+    existing_growid = cursor.fetchone()
+    
+    if existing_growid:
+        await interaction.response.send_message(
+            f"❌ GrowID **{growid}** is already linked to another Discord account!",
+            ephemeral=True
+        )
+        conn.close()
+        return
+    
+    # Link account
+    try:
+        cursor.execute('''
+            INSERT INTO discord_links (discord_id, growid, linked_at)
+            VALUES (?, ?, ?)
+        ''', (discord_id, growid, int(time.time())))
+        conn.commit()
+        
+        # Also create VP balance entry
+        db.get_or_create_user(discord_id, interaction.user.name)
+        
+        await interaction.response.send_message(
+            f"✅ Successfully linked!\n"
+            f"**Discord:** {interaction.user.mention}\n"
+            f"**GrowID:** {growid}\n\n"
+            f"You can now earn VP by staying in voice channels!\n"
+            f"Use `/vp` to check your balance.",
+            ephemeral=True
+        )
+        logger.info(f"Linked {interaction.user.name} ({discord_id}) to {growid}")
+        
+    except Exception as e:
+        await interaction.response.send_message(
+            f"❌ Failed to link account: {str(e)}",
+            ephemeral=True
+        )
+        logger.error(f"Link error: {e}")
+    finally:
+        conn.close()
+
+@bot.tree.command(name="unlink", description="Unlink your Discord account from GrowID (Admin only)")
+async def unlink_command(interaction: discord.Interaction, user: discord.Member = None):
+    """Unlink account (admin command)"""
+    # Check if admin
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ Only administrators can use this command!",
+            ephemeral=True
+        )
+        return
+    
+    target_id = user.id if user else interaction.user.id
+    target_name = user.mention if user else interaction.user.mention
+    
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT growid FROM discord_links WHERE discord_id=?', (target_id,))
+    existing = cursor.fetchone()
+    
+    if not existing:
+        await interaction.response.send_message(
+            f"❌ {target_name} is not linked!",
+            ephemeral=True
+        )
+        conn.close()
+        return
+    
+    cursor.execute('DELETE FROM discord_links WHERE discord_id=?', (target_id,))
+    conn.commit()
+    conn.close()
+    
+    await interaction.response.send_message(
+        f"✅ Unlinked {target_name} from **{existing[0]}**",
+        ephemeral=True
+    )
+    logger.info(f"Unlinked Discord ID {target_id} from {existing[0]}")
+
+@bot.tree.command(name="whois", description="Check who a GrowID is linked to")
+async def whois_command(interaction: discord.Interaction, growid: str):
+    """Check GrowID link"""
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT discord_id, linked_at FROM discord_links WHERE growid=?', (growid,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if not result:
+        await interaction.response.send_message(
+            f"❌ **{growid}** is not linked to any Discord account.",
+            ephemeral=True
+        )
+        return
+    
+    discord_id, linked_at = result
+    user = await bot.fetch_user(discord_id)
+    linked_date = datetime.fromtimestamp(linked_at).strftime('%Y-%m-%d %H:%M')
+    
+    embed = discord.Embed(
+        title="🔗 Account Link Info",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="GrowID", value=f"**{growid}**", inline=True)
+    embed.add_field(name="Discord", value=user.mention, inline=True)
+    embed.add_field(name="Linked Since", value=linked_date, inline=False)
+    
+    # Get VP balance
+    vp = db.get_vp(discord_id)
+    embed.add_field(name="VP Balance", value=f"{vp:,}", inline=True)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="mylink", description="Check your linked GrowID")
+async def mylink_command(interaction: discord.Interaction):
+    """Check own link"""
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT growid, linked_at FROM discord_links WHERE discord_id=?', (interaction.user.id,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if not result:
+        await interaction.response.send_message(
+            "❌ You are not linked!\nUse `/link <growid>` to link your account.",
+            ephemeral=True
+        )
+        return
+    
+    growid, linked_at = result
+    linked_date = datetime.fromtimestamp(linked_at).strftime('%Y-%m-%d %H:%M')
+    vp = db.get_vp(interaction.user.id)
+    
+    embed = discord.Embed(
+        title="🔗 Your Account Link",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="GrowID", value=f"**{growid}**", inline=True)
+    embed.add_field(name="VP Balance", value=f"{vp:,}", inline=True)
+    embed.add_field(name="Linked Since", value=linked_date, inline=False)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="vp", description="Check your Voice Points balance")
 async def vp_command(interaction: discord.Interaction):
     """Check VP balance"""
     user = db.get_or_create_user(interaction.user.id, interaction.user.name)
+    
+    # Get GrowID if linked
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT growid FROM discord_links WHERE discord_id=?', (interaction.user.id,))
+    link_result = cursor.fetchone()
+    conn.close()
     
     embed = discord.Embed(
         title="💎 Voice Points Balance",
         color=discord.Color.purple()
     )
     embed.add_field(name="Discord", value=interaction.user.mention, inline=True)
+    
+    if link_result:
+        embed.add_field(name="GrowID", value=f"**{link_result[0]}**", inline=True)
+    else:
+        embed.add_field(name="GrowID", value="Not linked", inline=True)
+    
     embed.add_field(name="Current VP", value=f"{user[2]:,}", inline=True)
     embed.add_field(name="Total Earned", value=f"{user[3]:,}", inline=True)
     
@@ -261,7 +459,11 @@ async def vp_command(interaction: discord.Interaction):
                 inline=False
             )
     
-    embed.set_footer(text="Use VP in-game with /vpshop command")
+    if not link_result:
+        embed.set_footer(text="Use /link <growid> to link your account and spend VP in-game!")
+    else:
+        embed.set_footer(text="Use /vpshop in-game to spend your VP!")
+    
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="leaderboard", description="View top VP earners")
@@ -296,7 +498,18 @@ async def help_command(interaction: discord.Interaction):
     )
     
     embed.add_field(
-        name="📝 Discord Commands",
+        name="🔗 Account Management",
+        value=(
+            "`/link <growid>` - Link your Discord to GrowID\n"
+            "`/mylink` - Check your linked GrowID\n"
+            "`/whois <growid>` - Check who owns a GrowID\n"
+            "`/unlink @user` - Unlink account (Admin only)"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="💰 Voice Points",
         value=(
             "`/vp` - Check your VP balance\n"
             "`/leaderboard` - View top earners\n"
@@ -306,13 +519,13 @@ async def help_command(interaction: discord.Interaction):
     )
     
     embed.add_field(
-        name="💰 Earning VP",
+        name="💎 Earning VP",
         value=f"Stay in <#{VP_CHANNEL_ID}> to earn **{VP_PER_MINUTE} VP per minute**",
         inline=False
     )
     
     embed.add_field(
-        name="💎 Gems Bonus",
+        name="🎁 Gems Bonus",
         value=f"Stay in <#{GEMS_CHANNEL_ID}> for **1.05x gems** while playing in-game",
         inline=False
     )
@@ -327,7 +540,7 @@ async def help_command(interaction: discord.Interaction):
         inline=False
     )
     
-    embed.set_footer(text="Your VP is linked to your Discord account automatically")
+    embed.set_footer(text="Link your account with /link to start earning VP!")
     await interaction.response.send_message(embed=embed)
 
 # Run bot
@@ -337,4 +550,3 @@ if __name__ == "__main__":
         exit(1)
     
     bot.run(DISCORD_TOKEN)
-
